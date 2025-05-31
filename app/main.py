@@ -7,6 +7,8 @@ import os # Added for GOOGLE_API_KEY
 import google.generativeai as genai # Added for Gemini API
 import httpx # Added for making HTTP requests
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio # Added for asyncio.create_task
+from fastapi.responses import HTMLResponse # Added for HTMLResponse
 
 from . import models
 from .models import SessionLocal, engine, get_db, Project, Page, ProjectResponse, PageResponse, GeneratedHtmlResponse # Removed FormData, ChatMessage and related Pydantic models
@@ -252,7 +254,7 @@ async def generate_form_fields(project_id: int, page_number: int, db: Session = 
 
         model = genai.GenerativeModel('gemini-2.5-flash-preview-05-20')
         prompt = """You are Expert in reading complex documents.
-        Task for you: Extract the information from the document, You need to convert physical document into a digital verion which imitates the physical form , keep information prefilled and editable.Rememeber the accuracy of the information extracted specially filled information is absolutely important.You need to take care of multilingual , checkboxes and handwritten complexity within document. give me the html with good stylinng for review, if you are not confident on any field or section enough mark that area as red so that Human can rectify that easily. The output should be the html page content without suffix or prefix."""
+        Task for you: Extract the information from the document, You need to convert physical document into a digital verion which imitates the physical form , keep information prefilled and editable.Rememeber the accuracy of the information extracted specially filled information is absolutely important.You need to take care of multilingual , checkboxes and handwritten complexity within document. give me the html with good stylinng for review, if you are not confident on any field or section enough mark that area as red so that Human can rectify that easily, there might be signatures on the documents, if there are multiple signatures on the document you have to match those documents and if there is dissimilarity between those signatures you need to highlight in red for those. There can be multiple singatures of a set of person, you need to also categorise the group of signature by the same person. The output should be the html page content without suffix or prefix."""
         pdf_blob = {
             'mime_type': 'application/pdf',
             'data': pdf_page_bytes
@@ -302,6 +304,75 @@ async def get_or_generate_form_html(project_id: int, page_number: int, db: Sessi
             status_code=404, 
             detail=f"HTML form for page {page_number} has not been generated yet. Use the POST /projects/{project_id}/pages/{page_number}/form/generate endpoint to create it."
         )
+
+@app.get("/projects/{project_id}/pages/{page_number}/html_view", response_class=HTMLResponse)
+async def view_generated_html_page(project_id: int, page_number: int, db: Session = Depends(get_db)):
+    db_page = db.query(models.Page).filter(models.Page.project_id == project_id, models.Page.page_number == page_number).first()
+    
+    if not db_page:
+        raise HTTPException(status_code=404, detail="Page not found")
+
+    if db_page.generated_form_html is not None:
+        return HTMLResponse(content=db_page.generated_form_html)
+    else:
+        # If generated_form_html is None, it means the form has not been generated yet.
+        # Return a simple HTML message or raise an error, depending on desired behavior.
+        # For now, returning an HTML message indicating it's not generated.
+        error_html = f"""
+        <html>
+            <head>
+                <title>HTML Not Generated</title>
+            </head>
+            <body>
+                <h1>HTML form for project {project_id}, page {page_number} has not been generated yet.</h1>
+                <p>Use the <code>POST /projects/{project_id}/pages/{page_number}/form/generate</code> endpoint to create it.</p>
+            </body>
+        </html>
+        """
+        return HTMLResponse(content=error_html, status_code=404)
+
+@app.get("/projects/generate-all-forms/", response_model=dict) # Changed path and response model
+async def generate_all_forms_for_project(project_id: int, db: Session = Depends(get_db)): # project_id as query param
+    db_project = db.query(models.Project).filter(models.Project.id == project_id).first()
+    if not db_project:
+        raise HTTPException(status_code=404, detail=f"Project with id {project_id} not found")
+
+    generation_status = {
+        "project_id": project_id,
+        "total_pages": db_project.total_pages,
+        "generation_tasks_initiated": 0,
+        "details": []
+    }
+
+    for page_num_to_generate in range(1, db_project.total_pages + 1):
+        # URL for the individual page form generation endpoint
+        # This endpoint is a POST request and does not require a body for this specific case.
+        url = f"http://localhost:8000/projects/{db_project.id}/pages/{page_num_to_generate}/form/generate"
+
+        async def trigger_page_generation(target_url: str, p_id: int, page_num: int):
+            try:
+                print(f"Initiating form generation via API call for project {p_id}, page {page_num} to {target_url}")
+                # Using the existing http_client
+                response = await http_client.post(target_url)
+                # Log outcome of the initiation call
+                if response.status_code >= 400:
+                    print(f"API call to initiate generation for project {p_id}, page {page_num} failed with status {response.status_code}: {response.text}")
+                else:
+                    print(f"Successfully initiated API call for form generation for project {p_id}, page {page_num}. Endpoint status: {response.status_code}")
+            except Exception as e:
+                print(f"Exception during API call to initiate generation for project {p_id}, page {page_num}: {str(e)}")
+
+        # Create a fire-and-forget task
+        asyncio.create_task(trigger_page_generation(url, db_project.id, page_num_to_generate))
+        
+        generation_status["generation_tasks_initiated"] += 1
+        generation_status["details"].append({
+            "page": page_num_to_generate,
+            "status": "generation_task_initiated"
+        })
+    
+    # db.refresh(db_project) # Removed as this endpoint now only initiates tasks
+    return {"message": f"Form generation tasks initiated for project {project_id}. Monitor server logs for detailed progress.", "status": generation_status}
 
 # Main application entry point for Uvicorn
 # To run: uvicorn app.main:app --reload
